@@ -343,9 +343,11 @@ class DockerRuntime(AbstractRuntime):
                 return
 
             import subprocess
+            import shutil
 
+            docker_cmd = "podman" if shutil.which("podman") and not shutil.which("docker") else "docker"
             subprocess.Popen(  # noqa: S603
-                ["docker", "rm", "-f", container_name],  # noqa: S607
+                [docker_cmd, "rm", "-f", container_name],  # noqa: S607
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
