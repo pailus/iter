@@ -1,7 +1,10 @@
 import asyncio
+import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 import litellm
 from jinja2 import Environment, FileSystemLoader, select_autoescape
@@ -167,7 +170,12 @@ class LLM:
             except Exception as e:  # noqa: BLE001
                 if attempt >= max_retries or not self._should_retry(e):
                     self._raise_error(e)
-                wait = min(90, 2 * (2**attempt))
+                # Provider-unavailable / mid-stream fallback errors (e.g. Alibaba rate smoothing)
+                # butuh backoff lebih lama — pakai cap 300s bukan 90s
+                is_provider_err = "MidStreamFallback" in type(e).__name__ or "provider_unavailable" in str(e)
+                cap = 300 if is_provider_err else 90
+                wait = min(cap, 2 * (2**attempt))
+                logger.warning("LLM retry %d/%d after %.0fs (error: %s)", attempt + 1, max_retries, wait, type(e).__name__)
                 await asyncio.sleep(wait)
 
     async def _stream(self, messages: list[dict[str, Any]]) -> AsyncIterator[LLMResponse]:
@@ -318,7 +326,17 @@ class LLM:
         code = getattr(e, "status_code", None) or getattr(
             getattr(e, "response", None), "status_code", None
         )
-        return code is None or litellm._should_retry(code)
+        # Selalu retry untuk rate limit (429) — tunggu aja, jangan fail
+        if code == 429:
+            return True
+        # Retry untuk server errors (5xx)
+        if code is not None and 500 <= code < 600:
+            return True
+        # Jika tidak ada status_code, kemungkinan network error — retry
+        if code is None:
+            return True
+        # Fallback ke litellm
+        return litellm._should_retry(code)
 
     def _raise_error(self, e: Exception) -> None:
         from strix.telemetry import posthog
