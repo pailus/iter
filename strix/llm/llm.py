@@ -210,9 +210,17 @@ class LLM:
 
         accumulated = normalize_tool_format(accumulated)
         accumulated = fix_incomplete_tool_call(_truncate_to_first_function(accumulated))
+        invocations = parse_tool_invocations(accumulated)
+        if "<function=" in accumulated and not invocations:
+            logger.warning("PARSE_FAIL raw=%r", accumulated[:500])
+        elif invocations:
+            for inv in invocations:
+                missing = [p for p, v in inv.get("args", {}).items() if not v]
+                if missing or not inv.get("args"):
+                    logger.warning("PARSE_PARTIAL tool=%s args=%r raw=%r", inv["toolName"], inv["args"], accumulated[:500])
         yield LLMResponse(
             content=accumulated,
-            tool_invocations=parse_tool_invocations(accumulated),
+            tool_invocations=invocations,
             thinking_blocks=self._extract_thinking(chunks),
         )
 
