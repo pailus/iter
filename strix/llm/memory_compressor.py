@@ -1,4 +1,5 @@
 import logging
+import time
 from typing import Any
 
 import litellm
@@ -7,6 +8,15 @@ from strix.config.config import Config, resolve_llm_config
 
 
 logger = logging.getLogger(__name__)
+
+_RETRYABLE_ERRORS = (
+    "connection error",
+    "incomplete chunked read",
+    "peer closed",
+    "remoteerror",
+    "timeout",
+    "timed out",
+)
 
 
 MAX_TOTAL_TOKENS = 100_000
@@ -106,29 +116,54 @@ def _summarize_messages(
 
     _, api_key, api_base = resolve_llm_config()
 
-    try:
-        completion_args: dict[str, Any] = {
-            "model": model,
-            "messages": [{"role": "user", "content": prompt}],
-            "timeout": timeout,
-        }
-        if api_key:
-            completion_args["api_key"] = api_key
-        if api_base:
-            completion_args["api_base"] = api_base
+    completion_args: dict[str, Any] = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "timeout": timeout,
+    }
+    if api_key:
+        completion_args["api_key"] = api_key
+    if api_base:
+        completion_args["api_base"] = api_base
 
-        response = litellm.completion(**completion_args)
-        summary = response.choices[0].message.content or ""
-        if not summary.strip():
-            return messages[0]
-        summary_msg = "<context_summary message_count='{count}'>{text}</context_summary>"
-        return {
-            "role": "user",
-            "content": summary_msg.format(count=len(messages), text=summary),
-        }
-    except Exception:
-        logger.exception("Failed to summarize messages")
-        return messages[0]
+    max_retries = 2
+    for attempt in range(max_retries + 1):
+        try:
+            response = litellm.completion(**completion_args)
+            summary = response.choices[0].message.content or ""
+            if not summary.strip():
+                break
+            summary_msg = "<context_summary message_count='{count}'>{text}</context_summary>"
+            return {
+                "role": "user",
+                "content": summary_msg.format(count=len(messages), text=summary),
+            }
+        except Exception as exc:
+            err_lower = str(exc).lower()
+            is_retryable = any(kw in err_lower for kw in _RETRYABLE_ERRORS)
+            if is_retryable and attempt < max_retries:
+                wait = 2 ** attempt  # 1s, 2s
+                logger.warning(
+                    "Memory compressor: connection error on attempt %d/%d, retrying in %ds: %s",
+                    attempt + 1, max_retries + 1, wait, exc,
+                )
+                time.sleep(wait)
+                continue
+            logger.warning(
+                "Memory compressor: failed to summarize %d messages (attempt %d): %s",
+                len(messages), attempt + 1, exc,
+            )
+            break
+
+    # Fallback: return a plain concatenation so no context is silently dropped
+    combined = "\n\n".join(
+        f"[{msg.get('role', 'unknown')}]: {_extract_message_text(msg)}"
+        for msg in messages
+    )
+    return {
+        "role": "user",
+        "content": f"<context_summary message_count='{len(messages)}'>{combined}</context_summary>",
+    }
 
 
 def _handle_images(messages: list[dict[str, Any]], max_images: int) -> None:
